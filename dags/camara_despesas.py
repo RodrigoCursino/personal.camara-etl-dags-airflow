@@ -68,9 +68,9 @@ with DAG(
         cmds=["python", "-m", "src.main"],
         arguments=["--env", "dev", "--domain", "despesas", "--layer", "bronze", "--uf", "SP", "--ano", "2026", "--mes", "5"],
         env_vars=env_vars,
-        get_logs=True,                  # Joga os logs do Python direto para a UI do Airflow
-        is_delete_operator_pod=True,    # Remove o pod automaticamente após o término
-        in_cluster=True,                # Comunicação interna segura com a API do K8s
+        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
+        on_finish_action="delete_succeeded_pod", # Remove o pod automaticamente após o término
+        in_cluster=True,                         # Comunicação interna segura com a API do K8s
         startup_timeout_seconds=120
     )
 
