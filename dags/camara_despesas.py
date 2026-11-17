@@ -4,7 +4,8 @@ from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperato
 from kubernetes.client import models as k8s
 
 def env(name, value):
-        return k8s.V1EnvVar(name=name, value=value)
+    return k8s.V1EnvVar(name=name, value=value)
+
 
 def secret_env(name, secret, key):
     return k8s.V1EnvVar(
@@ -48,8 +49,9 @@ env_vars = [
 with DAG(
     dag_id="camara_despesas",
     start_date=datetime(2026, 11, 16),
-    schedule="30 * * * *",  # Roda todo dia às 03:00 AM (substitui o antigo CronJob)
-    catchup=True,
+    schedule="30 * * * *",  # Roda de hora em hora, no minuto 30
+    catchup=False,
+    max_active_runs=1,  # Evita runs simultâneas sobrecarregando o cluster
     default_args={
         "owner": "rcursino",
         "retries": 2,
