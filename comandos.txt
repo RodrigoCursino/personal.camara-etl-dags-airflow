@@ -1,0 +1,15 @@
+
+1. Reiniciar o dag-processor (a mais direta). O init container do git-sync clona de novo ao subir:
+kubectl rollout restart deploy/airflow-dag-processor -n airflow
+
+2. Reprocessar as DAGs já baixadas. Isso não faz git pull, só relê os arquivos que já estão no pod:
+kubectl exec -n airflow deploy/airflow-dag-processor -c dag-processor -- airflow dags reserialize
+
+3. Conferir se o sync está funcionando:
+kubectl logs -n airflow deploy/airflow-dag-processor -c git-sync --tail=20
+kubectl exec -n airflow deploy/airflow-dag-processor -c dag-processor -- ls /opt/airflow/dags/repo/dags
+Se o log mostrar Authentication failed ou Repository not found, o problema ainda é o token ou o repositório vazio. Nenhum desses comandos resolve isso.
+
+Para o sync automático ficar mais rápido, ajuste no airflow.yaml, em dags.gitSync: period: 10s.
+
+Atenção: o git-credentials.yaml agora tem o token real (github_pat_...) escrito em texto, e ele apareceu no contexto desta conversa. Não faça commit desse arquivo. Se o token vazar ou o arquivo for versionado por engano, revogue-o em https://github.com/settings/personal-access-tokens e gere outro. Para o futuro, kubectl create secret generic ... --from-literal evita deixar o token em arquivo.

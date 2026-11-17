@@ -49,7 +49,7 @@ with DAG(
     dag_id="camara_despesas",
     start_date=datetime(2026, 11, 16),
     schedule="30 * * * *",  # Roda todo dia às 03:00 AM (substitui o antigo CronJob)
-    catchup=True
+    catchup=True,
     default_args={
         "owner": "rcursino",
         "retries": 2,
