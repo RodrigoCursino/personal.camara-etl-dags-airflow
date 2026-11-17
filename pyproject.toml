@@ -1,0 +1,18 @@
+[project]
+name = "dag-airflow"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "RodrigoCursino",email = "rodrigoapmc@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.13,<3.15"
+dependencies = [
+    "apache-airflow (==3.2.2)",
+    "apache-airflow-providers-cncf-kubernetes (>=11.0.0,<12.0.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
