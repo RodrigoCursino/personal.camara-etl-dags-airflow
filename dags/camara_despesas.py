@@ -3,7 +3,18 @@ from airflow.decorators import dag, task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from utils.variables import env_vars, UFS
 from utils.logger import logger
+from kubernetes.client import models as k8s
 import pendulum
+
+# Quantos pods de uma mesma camada podem rodar ao mesmo tempo (cada UF/período = 1 pod).
+# Sem isso, 27 UFs sobem juntas e esgotam a memória do nó.
+MAX_PARALLEL_PODS = 3
+
+# Recursos do pod do ETL. Valores iniciais: ajuste após medir o consumo real (kubectl top pod).
+ETL_RESOURCES = k8s.V1ResourceRequirements(
+    requests={"cpu": "250m", "memory": "512Mi"},
+    limits={"memory": "1Gi"},
+)
 
 local_tz = pendulum.timezone("America/Sao_Paulo")
 
@@ -150,90 +161,40 @@ def pipeline_camara():
     # --- Orquestração Dinâmica com .partial() e .expand() ---
     parametros_lista = build_parameter_matrix()
 
-    # Função auxiliar para criar a definição do KubernetesPodOperator com .partial()
-    def create_k8s_pod(layer: str):
-        return KubernetesPodOperator(  # Ou KubernetesPodOperator
-            task_id=f"etl_{layer}",
+    def etl_layer(layer: str):
+        """Uma instância mapeada (1 pod) por item da matriz UF x período."""
+        return KubernetesPodOperator.partial(
+            task_id=layer,
             name=f"camara-{layer}-worker",
             namespace="etl",
             image="rcursino/camara-etl:v1",
             cmds=["python", "-m", "src.main"],
-            arguments=[
-                "--env", "dev",
-                "--domain", "despesas",
-                "--layer", layer,
-                "--uf", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['uf'] }}",
-                "--ano", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['ano'] }}",
-                "--mes", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['mes'] }}"
-            ],
             env_vars=env_vars,
+            container_resources=ETL_RESOURCES,
             get_logs=True,
             on_finish_action="delete_succeeded_pod",
             in_cluster=True,
             startup_timeout_seconds=120,
+            max_active_tis_per_dag=MAX_PARALLEL_PODS,
+        ).expand(
+            arguments=parametros_lista.map(
+                lambda item: [
+                    "--env", "dev",
+                    "--domain", "despesas",
+                    "--layer", layer,
+                    "--uf", item["uf"],
+                    "--ano", item["ano"],
+                    "--mes", item["mes"],
+                ]
+            )
         )
-    
-    bronze = KubernetesPodOperator.partial(
-        task_id="bronze",
-        name="camara-bronze-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120,
-    ).expand(arguments=parametros_lista.map(lambda item: [
-        "--env", "dev",
-        "--domain", "despesas",
-        "--layer", "bronze",
-        "--uf", item["uf"],
-        "--ano", item["ano"],
-        "--mes", item["mes"]
-    ]))
 
-    silver = KubernetesPodOperator.partial(
-        task_id="silver",
-        name="camara-silver-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120,
-    ).expand(arguments=parametros_lista.map(lambda item: [
-        "--env", "dev",
-        "--domain", "despesas",
-        "--layer", "silver",
-        "--uf", item["uf"],
-        "--ano", item["ano"],
-        "--mes", item["mes"]
-    ]))
+    bronze = etl_layer("bronze")
+    silver = etl_layer("silver")
+    gold = etl_layer("gold")
 
-    gold = KubernetesPodOperator.partial(
-        task_id="gold",
-        name="camara-gold-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120,
-    ).expand(arguments=parametros_lista.map(lambda item: [
-        "--env", "dev",
-        "--domain", "despesas",
-        "--layer", "gold",
-        "--uf", item["uf"],
-        "--ano", item["ano"],
-        "--mes", item["mes"]
-    ]))
-
-    # Encadeamento das camadas mapeadas em paralelo
+    # Cada camada só começa quando a anterior terminou para todas as UFs
     bronze >> silver >> gold
+
 
 pipeline_camara()
