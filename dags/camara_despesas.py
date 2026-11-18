@@ -60,8 +60,8 @@ with DAG(
     tags=["etl", "camara", "kubernetes"],
 ) as dag:
 
-    executar_etl = KubernetesPodOperator(
-        task_id="rodar_bronze",
+    bronze = KubernetesPodOperator(
+        task_id="bronze",
         name="camara-bronze-worker",
         namespace="etl",
         image="rcursino/camara-etl:v1",
@@ -69,10 +69,24 @@ with DAG(
         arguments=["--env", "dev", "--domain", "despesas", "--layer", "bronze", "--uf", "SP", "--ano", "2026", "--mes", "5"],
         env_vars=env_vars,
         get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
-        on_finish_action="delete_succeeded_pod", # Remove o pod automaticamente após o término
+        on_finish_action="delete_succeeded_pod", 
         in_cluster=True,                         # Comunicação interna segura com a API do K8s
         startup_timeout_seconds=120
     )
 
-    executar_etl
+    silver = KubernetesPodOperator(
+        task_id="silver",
+        name="camara-silver-worker",
+        namespace="etl",
+        image="rcursino/camara-etl:v1",
+        cmds=["python", "-m", "src.main"],
+        arguments=["--env", "dev", "--domain", "despesas", "--layer", "silver", "--uf", "SP", "--ano", "2026", "--mes", "5"],
+        env_vars=env_vars,
+        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
+        on_finish_action="delete_succeeded_pod", 
+        in_cluster=True,                         # Comunicação interna segura com a API do K8s
+        startup_timeout_seconds=120
+    )
+
+    bronze >> silver
 
