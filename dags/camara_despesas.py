@@ -88,5 +88,19 @@ with DAG(
         startup_timeout_seconds=120
     )
 
-    bronze >> silver
+    gold = KubernetesPodOperator(
+        task_id="gold",
+        name="camara-gold-worker",
+        namespace="etl",
+        image="rcursino/camara-etl:v1",
+        cmds=["python", "-m", "src.main"],
+        arguments=["--env", "dev", "--domain", "despesas", "--layer", "gold", "--uf", "SP", "--ano", "2026", "--mes", "5"],
+        env_vars=env_vars,
+        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
+        on_finish_action="delete_succeeded_pod", 
+        in_cluster=True,                         # Comunicação interna segura com a API do K8s
+        startup_timeout_seconds=120
+    )
+
+    bronze >> silver >> gold
 
