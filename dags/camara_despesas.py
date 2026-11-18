@@ -1,9 +1,11 @@
 from datetime import datetime, timedelta
-from airflow.decorators import dag
+from airflow.decorators import dag, task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from utils.variables import env_vars
+from utils.variables import env_vars, UFS
 from utils.logger import logger
+import pendulum
 
+local_tz = pendulum.timezone("America/Sao_Paulo")
 
 def _ctx_data(context):
     """Campos comuns a todos os logs de task."""
@@ -17,7 +19,6 @@ def _ctx_data(context):
         "max_tries": task.retries + 1,
         "logical_date": str(context.get("logical_date")),
     }
-    # Parâmetros do pod (só os de negócio; env_vars nunca é logado, pode ter credencial)
     if getattr(task, "arguments", None):
         data["arguments"] = task.arguments
     if getattr(task, "image", None):
@@ -70,7 +71,6 @@ def log_dag_failure(context):
     logger.error("DAG run falhou", extra={"extra_data": data})
 
 
-# Log de parse (1x por parse da DAG): ajuda a confirmar config carregada, sem expor valores.
 logger.debug(
     "DAG camara_despesas carregada",
     extra={"extra_data": {"env_vars_keys": sorted(getattr(e, "name", str(e)) for e in env_vars)}},
@@ -80,9 +80,9 @@ logger.debug(
 @dag(
     dag_id="camara_despesas",
     start_date=datetime(2026, 11, 16),
-    schedule="0 22 * * *",  # Roda todos os dias às 22h (UTC, timezone padrão do Airflow)
+    schedule="0 22 * * *",
     catchup=False,
-    max_active_runs=1,  # Evita runs simultâneas sobrecarregando o cluster
+    max_active_runs=1,
     default_args={
         "owner": "rcursino",
         "retries": 3,
@@ -98,10 +98,62 @@ logger.debug(
 )
 def pipeline_camara():
 
-    def etl_task(layer: str) -> KubernetesPodOperator:
-        """Pod do camara-etl para uma camada (bronze/silver/gold)."""
-        return KubernetesPodOperator(
-            task_id=layer,
+    @task(task_id='generate_parameter_matrix')
+    def build_parameter_matrix(**context) -> list[dict]:
+        """
+        Analisa o dag_run.conf enviado na execução ou define os defaults.
+        Exemplos de conf aceitos:
+        - {"partition": "202605", "ufs": ["SP"]}
+        - {"from": "202601"}
+        - {"list": ["202601", "202610"]}
+        """
+        dag_run = context.get("dag_run")
+        conf = dag_run.conf if dag_run and dag_run.conf else {}
+
+        now = pendulum.now(local_tz)
+        ufs = conf.get("ufs", UFS)
+        
+        periodos = []
+        
+        if "partition" in conf:
+            val = conf["partition"]
+            periodos.append({"ano": val[:4], "mes": val[4:]})
+
+        elif "from" in conf:
+            from_str = conf["from"]
+            start_date = pendulum.datetime(int(from_str[:4]), int(from_str[4:]), 1, tz=local_tz)
+            curr = start_date
+            current_date = pendulum.datetime(now.year, now.month, 1, tz=local_tz)
+            while curr <= current_date:
+                periodos.append({"ano": str(curr.year), "mes": f"{curr.month:02d}"})
+                curr = curr.add(months=1)
+
+        elif "list" in conf:
+            for item in conf["list"]:
+                periodos.append({"ano": item[:4], "mes": item[4:]})
+        else:
+            # Default: Mês e ano atual se nenhum parâmetro de data for informado
+            periodos.append({"ano": str(now.year), "mes": f"{now.month:02d}"})
+
+        matrix = []
+        for periodo in periodos:
+            for uf in ufs:
+                matrix.append({
+                    "ano": periodo["ano"],
+                    "mes": periodo["mes"],
+                    "uf": uf
+                })
+
+        logger.info(f"Total de tarefas geradas para esta execução: {len(matrix)}")
+        return matrix
+
+    # --- Orquestração Dinâmica com .partial() e .expand() ---
+    parametros_lista = build_parameter_matrix()
+
+    # Função auxiliar para criar a definição do KubernetesPodOperator com .partial()
+    def create_k8s_pod(layer: str):
+        return KubernetesPodOperator(  # Ou KubernetesPodOperator
+            task_id=f"etl_{layer}",
             name=f"camara-{layer}-worker",
             namespace="etl",
             image="rcursino/camara-etl:v1",
@@ -110,9 +162,9 @@ def pipeline_camara():
                 "--env", "dev",
                 "--domain", "despesas",
                 "--layer", layer,
-                "--uf", "SP",
-                "--ano", "2026",
-                "--mes", "5",
+                "--uf", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['uf'] }}",
+                "--ano", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['ano'] }}",
+                "--mes", "{{ task_instance.xcom_pull(task_ids='generate_parameter_matrix')[ti.map_index]['mes'] }}"
             ],
             env_vars=env_vars,
             get_logs=True,
@@ -120,8 +172,68 @@ def pipeline_camara():
             in_cluster=True,
             startup_timeout_seconds=120,
         )
+    
+    bronze = KubernetesPodOperator.partial(
+        task_id="bronze",
+        name="camara-bronze-worker",
+        namespace="etl",
+        image="rcursino/camara-etl:v1",
+        cmds=["python", "-m", "src.main"],
+        env_vars=env_vars,
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
+        startup_timeout_seconds=120,
+    ).expand(arguments=parametros_lista.map(lambda item: [
+        "--env", "dev",
+        "--domain", "despesas",
+        "--layer", "bronze",
+        "--uf", item["uf"],
+        "--ano", item["ano"],
+        "--mes", item["mes"]
+    ]))
 
-    etl_task("bronze") >> etl_task("silver") >> etl_task("gold")
+    silver = KubernetesPodOperator.partial(
+        task_id="silver",
+        name="camara-silver-worker",
+        namespace="etl",
+        image="rcursino/camara-etl:v1",
+        cmds=["python", "-m", "src.main"],
+        env_vars=env_vars,
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
+        startup_timeout_seconds=120,
+    ).expand(arguments=parametros_lista.map(lambda item: [
+        "--env", "dev",
+        "--domain", "despesas",
+        "--layer", "silver",
+        "--uf", item["uf"],
+        "--ano", item["ano"],
+        "--mes", item["mes"]
+    ]))
 
+    gold = KubernetesPodOperator.partial(
+        task_id="gold",
+        name="camara-gold-worker",
+        namespace="etl",
+        image="rcursino/camara-etl:v1",
+        cmds=["python", "-m", "src.main"],
+        env_vars=env_vars,
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
+        startup_timeout_seconds=120,
+    ).expand(arguments=parametros_lista.map(lambda item: [
+        "--env", "dev",
+        "--domain", "despesas",
+        "--layer", "gold",
+        "--uf", item["uf"],
+        "--ano", item["ano"],
+        "--mes", item["mes"]
+    ]))
+
+    # Encadeamento das camadas mapeadas em paralelo
+    bronze >> silver >> gold
 
 pipeline_camara()
