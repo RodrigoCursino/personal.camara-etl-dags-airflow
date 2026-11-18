@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
-from dags.utils.variables import env_vars
+from utils.variables import env_vars
 from utils.logger import logger
 
 
