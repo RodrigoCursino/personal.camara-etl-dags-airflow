@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
-from airflow.decorators import dag, task
+from airflow.decorators import dag
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from utils.variables import env_vars
 from utils.logger import logger
 
@@ -79,7 +80,7 @@ logger.debug(
 @dag(
     dag_id="camara_despesas",
     start_date=datetime(2026, 11, 16),
-    schedule="* 22 * * *",  # Roda todos os dias ás 22 horas
+    schedule="0 22 * * *",  # Roda todos os dias às 22h (UTC, timezone padrão do Airflow)
     catchup=False,
     max_active_runs=1,  # Evita runs simultâneas sobrecarregando o cluster
     default_args={
@@ -97,62 +98,30 @@ logger.debug(
 )
 def pipeline_camara():
 
-    # Task Bronze usando o decorator @task.kubernetes
-    @task.kubernetes(
-        task_id="bronze",
-        name="camara-bronze-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        arguments=["--env", "dev", "--domain", "despesas", "--layer", "bronze", "--uf", "SP", "--ano", "2026", "--mes", "5"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120
-    )
-    def run_bronze():
-        pass  # O corpo da função não é executado localmente; o Airflow injeta a lógica no Pod do K8s definido nos argumentos do decorator
+    def etl_task(layer: str) -> KubernetesPodOperator:
+        """Pod do camara-etl para uma camada (bronze/silver/gold)."""
+        return KubernetesPodOperator(
+            task_id=layer,
+            name=f"camara-{layer}-worker",
+            namespace="etl",
+            image="rcursino/camara-etl:v1",
+            cmds=["python", "-m", "src.main"],
+            arguments=[
+                "--env", "dev",
+                "--domain", "despesas",
+                "--layer", layer,
+                "--uf", "SP",
+                "--ano", "2026",
+                "--mes", "5",
+            ],
+            env_vars=env_vars,
+            get_logs=True,
+            on_finish_action="delete_succeeded_pod",
+            in_cluster=True,
+            startup_timeout_seconds=120,
+        )
 
-    # Task Silver
-    @task.kubernetes(
-        task_id="silver",
-        name="camara-silver-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        arguments=["--env", "dev", "--domain", "despesas", "--layer", "silver", "--uf", "SP", "--ano", "2026", "--mes", "5"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120
-    )
-    def run_silver():
-        pass
+    etl_task("bronze") >> etl_task("silver") >> etl_task("gold")
 
-    # Task Gold
-    @task.kubernetes(
-        task_id="gold",
-        name="camara-gold-worker",
-        namespace="etl",
-        image="rcursino/camara-etl:v1",
-        cmds=["python", "-m", "src.main"],
-        arguments=["--env", "dev", "--domain", "despesas", "--layer", "gold", "--uf", "SP", "--ano", "2026", "--mes", "5"],
-        env_vars=env_vars,
-        get_logs=True,
-        on_finish_action="delete_succeeded_pod",
-        in_cluster=True,
-        startup_timeout_seconds=120
-    )
-    def run_gold():
-        pass
 
-    # Execução e encadeamento das tasks utilizando a TaskFlow API
-    t_bronze = run_bronze()
-    t_silver = run_silver()
-    t_gold = run_gold()
-
-    t_bronze >> t_silver >> t_gold
-
-pipeline_camara = pipeline_camara()
+pipeline_camara()
