@@ -1,4 +1,4 @@
-from dags.utils.helper import env, secret_env
+from utils.helper import env, secret_env
 
 env_vars = [
     # Banco de dados
