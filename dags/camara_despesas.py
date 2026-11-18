@@ -1,66 +1,104 @@
 from datetime import datetime, timedelta
-from airflow import DAG
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from kubernetes.client import models as k8s
-
-def env(name, value):
-    return k8s.V1EnvVar(name=name, value=value)
+from airflow.decorators import dag, task
+from dags.utils.variables import env_vars
+from utils.logger import logger
 
 
-def secret_env(name, secret, key):
-    return k8s.V1EnvVar(
-        name=name,
-        value_from=k8s.V1EnvVarSource(
-            secret_key_ref=k8s.V1SecretKeySelector(name=secret, key=key)
-        ),
+def _ctx_data(context):
+    """Campos comuns a todos os logs de task."""
+    ti = context["ti"]
+    task = context["task"]
+    data = {
+        "dag_id": ti.dag_id,
+        "task_id": ti.task_id,
+        "run_id": context["run_id"],
+        "try_number": ti.try_number,
+        "max_tries": task.retries + 1,
+        "logical_date": str(context.get("logical_date")),
+    }
+    # Parâmetros do pod (só os de negócio; env_vars nunca é logado, pode ter credencial)
+    if getattr(task, "arguments", None):
+        data["arguments"] = task.arguments
+    if getattr(task, "image", None):
+        data["image"] = task.image
+    if ti.start_date:
+        data["duration_s"] = round((datetime.now(ti.start_date.tzinfo) - ti.start_date).total_seconds(), 1)
+    return data
+
+
+def log_start(context):
+    logger.info("task iniciada", extra={"extra_data": _ctx_data(context)})
+
+
+def log_success(context):
+    logger.info("task concluída", extra={"extra_data": _ctx_data(context)})
+
+
+def log_retry(context):
+    data = _ctx_data(context)
+    ti = context["ti"]
+    data["error"] = str(context.get("exception"))
+    data["next_retry_in"] = str(context["task"].retry_delay)
+    logger.warning(
+        f"task falhou, nova tentativa {ti.try_number + 1}/{data['max_tries']}",
+        extra={"extra_data": data},
     )
 
-env_vars = [
-    # Banco de dados
-    env("DATABASE_TYPE", "duckdb"),
-    env("DATABASE_PATH", "data/camara_warehouse.dev.db"),
-    # Ambiente
-    env("ENVIRONMENT_NAME", "dev"),
-    env("DEBUG", "true"),
-    env("LOGGING_LEVEL", "DEBUG"),
-    # Fila (RabbitMQ)
-    env("QUEUE_TYPE", "rabbitmq"),
-    env("RABBITMQ_HOST", "rabbitmq"),
-    env("RABBITMQ_PORT", "5672"),
-    env("RABBITMQ_USER", "guest"),
-    env("RABBITMQ_PASSWORD", "guest"),
-    # API da Câmara
-    env("CAMARA_API_BASE_URL", "https://dadosabertos.camara.leg.br/api"),
-    env("CAMARA_API_VERSION", "v2"),
-    env("CAMARA_API_TIMEOUT", "15"),
-    env("CAMARA_API_MAX_RETRIES", "5"),
-    # Engine de consultas
-    env("QUERIES_ENGINE", "duckdb"),
-    # Storage (MinIO via S3)
-    env("STORAGE_TYPE", "minio"),
-    env("S3_BUCKET", "camara-warehouse"),
-    env("S3_ENDPOINT", "http://minio-service.minio.svc.cluster.local:9000"),
-    secret_env("S3_ACCESS_KEY", "minio-credentials", "accesskey"),
-    secret_env("S3_SECRET_KEY", "minio-credentials", "secretkey"),
-]
+
+def log_failure(context):
+    data = _ctx_data(context)
+    data["error"] = str(context.get("exception"))
+    logger.error("task falhou definitivamente (sem mais retries)", extra={"extra_data": data})
 
 
+def _dag_run_data(context):
+    dr = context["dag_run"]
+    data = {"dag_id": dr.dag_id, "run_id": dr.run_id, "run_type": str(dr.run_type)}
+    if dr.start_date:
+        data["duration_s"] = round((datetime.now(dr.start_date.tzinfo) - dr.start_date).total_seconds(), 1)
+    return data
 
-with DAG(
+
+def log_dag_success(context):
+    logger.info("DAG run concluída com sucesso", extra={"extra_data": _dag_run_data(context)})
+
+
+def log_dag_failure(context):
+    data = _dag_run_data(context)
+    data["reason"] = context.get("reason")
+    logger.error("DAG run falhou", extra={"extra_data": data})
+
+
+# Log de parse (1x por parse da DAG): ajuda a confirmar config carregada, sem expor valores.
+logger.debug(
+    "DAG camara_despesas carregada",
+    extra={"extra_data": {"env_vars_keys": sorted(getattr(e, "name", str(e)) for e in env_vars)}},
+)
+
+
+@dag(
     dag_id="camara_despesas",
     start_date=datetime(2026, 11, 16),
-    schedule="30 * * * *",  # Roda de hora em hora, no minuto 30
+    schedule="* 22 * * *",  # Roda todos os dias ás 22 horas
     catchup=False,
     max_active_runs=1,  # Evita runs simultâneas sobrecarregando o cluster
     default_args={
         "owner": "rcursino",
-        "retries": 2,
-        "retry_delay": timedelta(minutes=3),
+        "retries": 3,
+        "retry_delay": timedelta(minutes=15),
+        "on_execute_callback": log_start,
+        "on_success_callback": log_success,
+        "on_retry_callback": log_retry,
+        "on_failure_callback": log_failure,
     },
+    on_success_callback=log_dag_success,
+    on_failure_callback=log_dag_failure,
     tags=["etl", "camara", "kubernetes"],
-) as dag:
+)
+def pipeline_camara():
 
-    bronze = KubernetesPodOperator(
+    # Task Bronze usando o decorator @task.kubernetes
+    @task.kubernetes(
         task_id="bronze",
         name="camara-bronze-worker",
         namespace="etl",
@@ -68,13 +106,16 @@ with DAG(
         cmds=["python", "-m", "src.main"],
         arguments=["--env", "dev", "--domain", "despesas", "--layer", "bronze", "--uf", "SP", "--ano", "2026", "--mes", "5"],
         env_vars=env_vars,
-        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
-        on_finish_action="delete_succeeded_pod", 
-        in_cluster=True,                         # Comunicação interna segura com a API do K8s
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
         startup_timeout_seconds=120
     )
+    def run_bronze():
+        pass  # O corpo da função não é executado localmente; o Airflow injeta a lógica no Pod do K8s definido nos argumentos do decorator
 
-    silver = KubernetesPodOperator(
+    # Task Silver
+    @task.kubernetes(
         task_id="silver",
         name="camara-silver-worker",
         namespace="etl",
@@ -82,13 +123,16 @@ with DAG(
         cmds=["python", "-m", "src.main"],
         arguments=["--env", "dev", "--domain", "despesas", "--layer", "silver", "--uf", "SP", "--ano", "2026", "--mes", "5"],
         env_vars=env_vars,
-        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
-        on_finish_action="delete_succeeded_pod", 
-        in_cluster=True,                         # Comunicação interna segura com a API do K8s
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
         startup_timeout_seconds=120
     )
+    def run_silver():
+        pass
 
-    gold = KubernetesPodOperator(
+    # Task Gold
+    @task.kubernetes(
         task_id="gold",
         name="camara-gold-worker",
         namespace="etl",
@@ -96,11 +140,19 @@ with DAG(
         cmds=["python", "-m", "src.main"],
         arguments=["--env", "dev", "--domain", "despesas", "--layer", "gold", "--uf", "SP", "--ano", "2026", "--mes", "5"],
         env_vars=env_vars,
-        get_logs=True,                           # Joga os logs do Python direto para a UI do Airflow
-        on_finish_action="delete_succeeded_pod", 
-        in_cluster=True,                         # Comunicação interna segura com a API do K8s
+        get_logs=True,
+        on_finish_action="delete_succeeded_pod",
+        in_cluster=True,
         startup_timeout_seconds=120
     )
+    def run_gold():
+        pass
 
-    bronze >> silver >> gold
+    # Execução e encadeamento das tasks utilizando a TaskFlow API
+    t_bronze = run_bronze()
+    t_silver = run_silver()
+    t_gold = run_gold()
 
+    t_bronze >> t_silver >> t_gold
+
+pipeline_camara = pipeline_camara()
