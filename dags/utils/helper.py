@@ -42,6 +42,9 @@ def ctx_data(context):
 def set_trace_ids(context):
     """Injeta no env do pod: EXCUTION_ID (por DAG run) e TASK_ID (por execução de task)."""
     task = context["task"]
+    # default_args também se aplica a tasks @task (PythonOperator), que não têm env_vars
+    if not hasattr(task, "env_vars"):
+        return
     # uuid5 determinístico: todas as tasks (e retries) do mesmo DAG run obtêm o mesmo valor
     execution_id = str(uuid5(NAMESPACE_URL, f"{context['dag'].dag_id}/{context['run_id']}"))
     task_id = str(uuid4())
