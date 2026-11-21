@@ -6,7 +6,7 @@ UFS = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO",
 "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", 
 "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
 
-IMAGE = "rcursino/camara-etl:v4"
+IMAGE = "rcursino/camara-etl:v5"
 
 local_tz = pendulum.timezone("America/Sao_Paulo")
 
