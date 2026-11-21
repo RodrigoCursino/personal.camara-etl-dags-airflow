@@ -83,7 +83,7 @@ def pipeline_eventos():
     parametros_lista = build_parameter_matrix()
 
     def etl_layer(layer: str):
-        """Uma instância mapeada (1 pod) por item da matriz UF x período."""
+        """Uma instância mapeada (1 pod) por item da matriz período."""
     
         return KubernetesPodOperator.partial(
             task_id=layer,
@@ -104,7 +104,6 @@ def pipeline_eventos():
                     "--env", "dev",
                     "--domain", "eventos",
                     "--layer", layer,
-                    "--uf", item["uf"],
                     "--ano", item["ano"],
                     "--mes", item["mes"],
                 ]
