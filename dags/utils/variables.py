@@ -13,6 +13,8 @@ env_vars = [
     env("ENVIRONMENT_NAME", "dev"),
     env("DEBUG", "true"),
     env("LOGGING_LEVEL", "DEBUG"),
+    env("TASK_ID", ""),
+    env("EXCUTION_ID", ""),
     # Fila (RabbitMQ)
     env("QUEUE_TYPE", "rabbitmq"),
     env("RABBITMQ_HOST", "rabbitmq"),

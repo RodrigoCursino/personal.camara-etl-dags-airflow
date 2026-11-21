@@ -4,11 +4,13 @@ from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperato
 from utils.variables import env_vars, UFS
 from utils.logger import logger
 from kubernetes.client import models as k8s
+from uuid import uuid4, uuid5, NAMESPACE_URL
+import os
 import pendulum
 
 # Quantos pods de uma mesma camada podem rodar ao mesmo tempo (cada UF/período = 1 pod).
 # Sem isso, 27 UFs sobem juntas e esgotam a memória do nó.
-MAX_PARALLEL_PODS = 3
+MAX_PARALLEL_PODS = 1
 
 # Recursos do pod do ETL. Valores iniciais: ajuste após medir o consumo real (kubectl top pod).
 ETL_RESOURCES = k8s.V1ResourceRequirements(
@@ -37,6 +39,28 @@ def _ctx_data(context):
     if ti.start_date:
         data["duration_s"] = round((datetime.now(ti.start_date.tzinfo) - ti.start_date).total_seconds(), 1)
     return data
+
+
+TASK_ENV_NAME = "TASK_ID"        # uuid por execução de task (muda a cada retry)
+EXECUTION_ENV_NAME = "EXCUTION_ID"  # uuid por DAG run (igual para todas as tasks); nome conforme utils/variables.py
+
+
+def set_trace_ids(context):
+    """Injeta no env do pod: EXCUTION_ID (por DAG run) e TASK_ID (por execução de task)."""
+    task = context["task"]
+    # uuid5 determinístico: todas as tasks (e retries) do mesmo DAG run obtêm o mesmo valor
+    execution_id = str(uuid5(NAMESPACE_URL, f"{context['dag'].dag_id}/{context['run_id']}"))
+    task_id = str(uuid4())
+    names = {EXECUTION_ENV_NAME, TASK_ENV_NAME}
+    # Copia a lista para não mutar o env_vars compartilhado entre tasks
+    task.env_vars = [e for e in (task.env_vars or []) if getattr(e, "name", None) not in names] + [
+        k8s.V1EnvVar(name=EXECUTION_ENV_NAME, value=execution_id),
+        k8s.V1EnvVar(name=TASK_ENV_NAME, value=task_id),
+    ]
+    logger.info(
+        "ids de rastreio gerados",
+        extra={"extra_data": {**_ctx_data(context), "execution_id": execution_id, "task_uuid": task_id}},
+    )
 
 
 def log_start(context):
@@ -98,6 +122,7 @@ logger.debug(
         "owner": "rcursino",
         "retries": 3,
         "retry_delay": timedelta(minutes=15),
+        "pre_execute": set_trace_ids,
         "on_execute_callback": log_start,
         "on_success_callback": log_success,
         "on_retry_callback": log_retry,
@@ -163,6 +188,7 @@ def pipeline_camara():
 
     def etl_layer(layer: str):
         """Uma instância mapeada (1 pod) por item da matriz UF x período."""
+
         return KubernetesPodOperator.partial(
             task_id=layer,
             name=f"camara-{layer}-worker",
