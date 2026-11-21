@@ -1,9 +1,24 @@
 from utils.helper import env, secret_env
+from kubernetes.client import models as k8s
+import pendulum
 
 UFS = ["AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", 
 "MA", "MT", "MS", "MG", "PA", "PB", "PR", "PE", 
 "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO"]
 
+IMAGE = "rcursino/camara-etl:v3"
+
+local_tz = pendulum.timezone("America/Sao_Paulo")
+
+# Quantos pods de uma mesma camada podem rodar ao mesmo tempo (cada UF/período = 1 pod).
+# Sem isso, 27 UFs sobem juntas e esgotam a memória do nó.
+MAX_PARALLEL_PODS = 1
+
+# Recursos do pod do ETL. Valores iniciais: ajuste após medir o consumo real (kubectl top pod).
+ETL_RESOURCES = k8s.V1ResourceRequirements(
+    requests={"cpu": "250m", "memory": "512Mi"},
+    limits={"memory": "1Gi"},
+)
 
 env_vars = [
     # Banco de dados

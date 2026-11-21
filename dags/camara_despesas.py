@@ -1,116 +1,15 @@
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from utils.variables import env_vars, UFS
+from utils.variables import env_vars, UFS, ETL_RESOURCES, MAX_PARALLEL_PODS, local_tz, IMAGE
 from utils.logger import logger
-from kubernetes.client import models as k8s
-from uuid import uuid4, uuid5, NAMESPACE_URL
-import os
+from utils.helper import set_trace_ids, log_dag_failure, log_retry, log_success, log_start, log_failure, log_dag_success
 import pendulum
-
-# Quantos pods de uma mesma camada podem rodar ao mesmo tempo (cada UF/período = 1 pod).
-# Sem isso, 27 UFs sobem juntas e esgotam a memória do nó.
-MAX_PARALLEL_PODS = 1
-
-# Recursos do pod do ETL. Valores iniciais: ajuste após medir o consumo real (kubectl top pod).
-ETL_RESOURCES = k8s.V1ResourceRequirements(
-    requests={"cpu": "250m", "memory": "512Mi"},
-    limits={"memory": "1Gi"},
-)
-
-local_tz = pendulum.timezone("America/Sao_Paulo")
-
-def _ctx_data(context):
-    """Campos comuns a todos os logs de task."""
-    ti = context["ti"]
-    task = context["task"]
-    data = {
-        "dag_id": ti.dag_id,
-        "task_id": ti.task_id,
-        "run_id": context["run_id"],
-        "try_number": ti.try_number,
-        "max_tries": task.retries + 1,
-        "logical_date": str(context.get("logical_date")),
-    }
-    if getattr(task, "arguments", None):
-        data["arguments"] = task.arguments
-    if getattr(task, "image", None):
-        data["image"] = task.image
-    if ti.start_date:
-        data["duration_s"] = round((datetime.now(ti.start_date.tzinfo) - ti.start_date).total_seconds(), 1)
-    return data
-
-
-TASK_ENV_NAME = "TASK_ID"        # uuid por execução de task (muda a cada retry)
-EXECUTION_ENV_NAME = "EXCUTION_ID"  # uuid por DAG run (igual para todas as tasks); nome conforme utils/variables.py
-
-
-def set_trace_ids(context):
-    """Injeta no env do pod: EXCUTION_ID (por DAG run) e TASK_ID (por execução de task)."""
-    task = context["task"]
-    # uuid5 determinístico: todas as tasks (e retries) do mesmo DAG run obtêm o mesmo valor
-    execution_id = str(uuid5(NAMESPACE_URL, f"{context['dag'].dag_id}/{context['run_id']}"))
-    task_id = str(uuid4())
-    names = {EXECUTION_ENV_NAME, TASK_ENV_NAME}
-    # Copia a lista para não mutar o env_vars compartilhado entre tasks
-    task.env_vars = [e for e in (task.env_vars or []) if getattr(e, "name", None) not in names] + [
-        k8s.V1EnvVar(name=EXECUTION_ENV_NAME, value=execution_id),
-        k8s.V1EnvVar(name=TASK_ENV_NAME, value=task_id),
-    ]
-    logger.info(
-        "ids de rastreio gerados",
-        extra={"extra_data": {**_ctx_data(context), "execution_id": execution_id, "task_uuid": task_id}},
-    )
-
-
-def log_start(context):
-    logger.info("task iniciada", extra={"extra_data": _ctx_data(context)})
-
-
-def log_success(context):
-    logger.info("task concluída", extra={"extra_data": _ctx_data(context)})
-
-
-def log_retry(context):
-    data = _ctx_data(context)
-    ti = context["ti"]
-    data["error"] = str(context.get("exception"))
-    data["next_retry_in"] = str(context["task"].retry_delay)
-    logger.warning(
-        f"task falhou, nova tentativa {ti.try_number + 1}/{data['max_tries']}",
-        extra={"extra_data": data},
-    )
-
-
-def log_failure(context):
-    data = _ctx_data(context)
-    data["error"] = str(context.get("exception"))
-    logger.error("task falhou definitivamente (sem mais retries)", extra={"extra_data": data})
-
-
-def _dag_run_data(context):
-    dr = context["dag_run"]
-    data = {"dag_id": dr.dag_id, "run_id": dr.run_id, "run_type": str(dr.run_type)}
-    if dr.start_date:
-        data["duration_s"] = round((datetime.now(dr.start_date.tzinfo) - dr.start_date).total_seconds(), 1)
-    return data
-
-
-def log_dag_success(context):
-    logger.info("DAG run concluída com sucesso", extra={"extra_data": _dag_run_data(context)})
-
-
-def log_dag_failure(context):
-    data = _dag_run_data(context)
-    data["reason"] = context.get("reason")
-    logger.error("DAG run falhou", extra={"extra_data": data})
-
 
 logger.debug(
     "DAG camara_despesas carregada",
     extra={"extra_data": {"env_vars_keys": sorted(getattr(e, "name", str(e)) for e in env_vars)}},
 )
-
 
 @dag(
     dag_id="camara_despesas",
@@ -130,7 +29,7 @@ logger.debug(
     },
     on_success_callback=log_dag_success,
     on_failure_callback=log_dag_failure,
-    tags=["etl", "camara", "kubernetes"],
+    tags=["etl", "camara", "despesas", "kubernetes"],
 )
 def pipeline_camara():
 
@@ -193,7 +92,7 @@ def pipeline_camara():
             task_id=layer,
             name=f"camara-{layer}-worker",
             namespace="etl",
-            image="rcursino/camara-etl:v1",
+            image=IMAGE,
             cmds=["python", "-m", "src.main"],
             env_vars=env_vars,
             container_resources=ETL_RESOURCES,
